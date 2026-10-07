@@ -5,6 +5,7 @@ Endpoints
 GET  /healthz                         liveness/readiness probe
 POST /api/attestations                submit a signed attestation
 GET  /api/devices/{deviceId}/head     current accepted generation + digest
+GET  /api/devices/{deviceId}/effective  highest generation already in effect
 
 All errors return JSON ``{"error": {"code", "message"}}`` with a stable
 machine-readable ``code``.
@@ -22,6 +23,7 @@ from .admit import (
     Admitter,
     ERR_INTERNAL,
     ERR_MALFORMED,
+    ERR_NO_EFFECTIVE,
 )
 from .config import KeyConfigError, load_key_bindings, load_keys
 from .store import Store
@@ -90,29 +92,52 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(200, {"status": "ok"})
             return
         prefix = "/api/devices/"
-        suffix = "/head"
-        if path.startswith(prefix) and path.endswith(suffix):
-            device_id = unquote(path[len(prefix) : -len(suffix)])
-            if not device_id or "/" in device_id:
-                self._error(404, "NOT_FOUND", "unknown path")
-                return
-            head = self.admitter.head(device_id)
-            if head is None:
-                self._error(404, "DEVICE_NOT_FOUND", f"no accepted attestation for device {device_id!r}")
-                return
-            self._send_json(
-                200,
-                {
-                    "deviceId": head["deviceId"],
-                    "generation": head["generation"],
-                    "previousGeneration": head["previousGeneration"],
-                    "configSha256": head["configSha256"],
-                    "attestationId": head["attestationId"],
-                    "acceptedAt": head["acceptedAt"],
-                },
+        if path.startswith(prefix):
+            for suffix, handler in (
+                ("/head", self._handle_head),
+                ("/effective", self._handle_effective),
+            ):
+                if path.endswith(suffix):
+                    device_id = unquote(path[len(prefix) : -len(suffix)])
+                    if not device_id or "/" in device_id:
+                        self._error(404, "NOT_FOUND", "unknown path")
+                        return
+                    handler(device_id)
+                    return
+        self._error(404, "NOT_FOUND", "unknown path")
+
+    def _record_body(self, head: dict) -> dict:
+        body = {
+            "deviceId": head["deviceId"],
+            "generation": head["generation"],
+            "previousGeneration": head["previousGeneration"],
+            "configSha256": head["configSha256"],
+            "attestationId": head["attestationId"],
+            "acceptedAt": head["acceptedAt"],
+        }
+        # Omitted on immediate activations so legacy responses stay identical.
+        if head.get("activateAt"):
+            body["activateAt"] = head["activateAt"]
+        return body
+
+    def _handle_head(self, device_id: str) -> None:
+        head = self.admitter.head(device_id)
+        if head is None:
+            self._error(404, "DEVICE_NOT_FOUND", f"no accepted attestation for device {device_id!r}")
+            return
+        self._send_json(200, self._record_body(head))
+
+    def _handle_effective(self, device_id: str) -> None:
+        effective = self.admitter.effective(device_id)
+        if effective is None:
+            # Either the device is unknown or every accepted generation is
+            # still scheduled for a later instant.
+            self._error(
+                404, ERR_NO_EFFECTIVE,
+                f"no configuration is currently in effect for device {device_id!r}",
             )
             return
-        self._error(404, "NOT_FOUND", "unknown path")
+        self._send_json(200, self._record_body(effective))
 
     # ------------------------------------------------------------------ POST
     def do_POST(self) -> None:
@@ -131,18 +156,9 @@ class Handler(BaseHTTPRequestHandler):
         )
         if decision.accepted:
             rec = decision.record or {}
-            self._send_json(
-                decision.status,
-                {
-                    "status": "duplicate" if decision.duplicate else "accepted",
-                    "deviceId": rec.get("deviceId"),
-                    "generation": rec.get("generation"),
-                    "previousGeneration": rec.get("previousGeneration"),
-                    "configSha256": rec.get("configSha256"),
-                    "attestationId": rec.get("attestationId"),
-                    "acceptedAt": rec.get("acceptedAt"),
-                },
-            )
+            body = self._record_body(rec)
+            body = {"status": "duplicate" if decision.duplicate else "accepted", **body}
+            self._send_json(decision.status, body)
         else:
             self._error(decision.status, decision.code, decision.message)
 

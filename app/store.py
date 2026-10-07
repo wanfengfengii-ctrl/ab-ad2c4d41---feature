@@ -24,10 +24,17 @@ CREATE TABLE IF NOT EXISTS attestations (
     attestation_id    TEXT    NOT NULL,
     payload_sha256    TEXT    NOT NULL,
     accepted_at       TEXT    NOT NULL,
+    activate_at       TEXT,
     PRIMARY KEY (device_id, generation),
     UNIQUE (attestation_id)
 );
 """
+
+# Columns added after the first release, mapped to their DDL. Existing volume
+# databases are migrated in place on startup.
+_MIGRATIONS = (
+    ("activate_at", "ALTER TABLE attestations ADD COLUMN activate_at TEXT"),
+)
 
 
 class StoredAttestation:
@@ -39,6 +46,7 @@ class StoredAttestation:
         "attestation_id",
         "payload_sha256",
         "accepted_at",
+        "activate_at",
     )
 
     def __init__(self, row: sqlite3.Row):
@@ -49,6 +57,9 @@ class StoredAttestation:
         self.attestation_id = row["attestation_id"]
         self.payload_sha256 = row["payload_sha256"]
         self.accepted_at = row["accepted_at"]
+        # NULL for rows written before scheduled activation existed; such rows
+        # are treated as having taken effect immediately at accepted_at.
+        self.activate_at = row["activate_at"] if "activate_at" in row.keys() else None
 
     def to_dict(self) -> dict:
         return {
@@ -58,6 +69,7 @@ class StoredAttestation:
             "configSha256": self.config_sha256,
             "attestationId": self.attestation_id,
             "acceptedAt": self.accepted_at,
+            "activateAt": self.activate_at,
         }
 
 
@@ -74,7 +86,22 @@ class Store:
         self._busy_timeout = busy_timeout_ms
         with self._connect() as conn:
             conn.executescript(SCHEMA)
+            self._migrate(conn)
             conn.commit()
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        """Add columns introduced after the first release, in place.
+
+        Rows from a pre-upgrade volume keep ``activate_at`` NULL, which means
+        they took effect immediately at their original ``accepted_at``.
+        """
+        existing = {
+            r["name"]
+            for r in conn.execute("PRAGMA table_info(attestations)").fetchall()
+        }
+        for column, ddl in _MIGRATIONS:
+            if column not in existing:
+                conn.execute(ddl)
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(
@@ -136,12 +163,13 @@ class Store:
         attestation_id: str,
         payload_sha256: str,
         accepted_at: str,
+        activate_at: Optional[str] = None,
     ) -> None:
         conn.execute(
             "INSERT INTO attestations "
             "(device_id, generation, previous_generation, config_sha256, "
-            " attestation_id, payload_sha256, accepted_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            " attestation_id, payload_sha256, accepted_at, activate_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 device_id,
                 generation,
@@ -150,6 +178,7 @@ class Store:
                 attestation_id,
                 payload_sha256,
                 accepted_at,
+                activate_at,
             ),
         )
 
@@ -189,3 +218,20 @@ class Store:
                 (device_id,),
             ).fetchall()
         return [r["generation"] for r in rows]
+
+    def effective(
+        self, device_id: str, as_of: str
+    ) -> Optional[StoredAttestation]:
+        """Highest-generation config due at or before ``as_of`` (RFC3339 Z).
+
+        Rows with a scheduled ``activate_at`` take effect then; rows without
+        one (pre-upgrade records) take effect at their original ``accepted_at``.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM attestations "
+                "WHERE device_id = ? AND COALESCE(activate_at, accepted_at) <= ? "
+                "ORDER BY generation DESC LIMIT 1",
+                (device_id, as_of),
+            ).fetchone()
+        return StoredAttestation(row) if row is not None else None

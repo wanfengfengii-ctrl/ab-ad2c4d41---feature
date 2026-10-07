@@ -18,6 +18,7 @@ import sys
 import tempfile
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -33,6 +34,42 @@ def check(name: str, condition: bool, detail: str = "") -> None:
     global FAILURES
     if not condition:
         FAILURES += 1
+
+
+def utc_stamp(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def signed_envelope(att_id, key_id, device, gen, prev, config, seed,
+                    activate_at=None):
+    doc = {
+        "deviceId": device,
+        "generation": gen,
+        "previousGeneration": prev,
+        "configSha256": hashlib.sha256(config).hexdigest(),
+    }
+    if activate_at is not None:
+        doc["activateAt"] = activate_at
+    payload = json.dumps(doc, separators=(",", ":")).encode()
+    return {
+        "attestationId": att_id,
+        "keyId": key_id,
+        "payloadBase64": base64.b64encode(payload).decode(),
+        "signatureBase64": base64.b64encode(ed25519.sign(payload, seed)).decode(),
+    }
+
+
+def wait_for_effective(port, device, generation, timeout=10.0):
+    """Poll /effective until it reports ``generation`` (or time out)."""
+    deadline = time.time() + timeout
+    last = None
+    while time.time() < deadline:
+        status, body = request(port, "GET", f"/api/devices/{device}/effective")
+        last = (status, body)
+        if status == 200 and body.get("generation") == generation:
+            return True, body
+        time.sleep(0.1)
+    return False, last
 
 
 def request(port: int, method: str, path: str, body=None):
@@ -55,12 +92,22 @@ def main() -> int:
     public = ed25519.publickey(seed)
     key_id = "smoke-vendor"
     device = "smoke-sat-1"
+    # A second, unbound key lets the smoke exercise an unrelated device.
+    seed2 = bytes.fromhex("9d61b19deffd5a60ba844af492ec2cc4" "4449c5697b326919703bac031cae7f60")
+    public2 = ed25519.publickey(seed2)
+    key_id2 = "smoke-vendor-unbound"
     with open(keys_path, "w", encoding="utf-8") as fh:
-        json.dump({"keys": {key_id: {
-            "algorithm": "Ed25519",
-            "publicKeyBase64": base64.b64encode(public).decode(),
-            "deviceId": device,
-        }}}, fh)
+        json.dump({"keys": {
+            key_id: {
+                "algorithm": "Ed25519",
+                "publicKeyBase64": base64.b64encode(public).decode(),
+                "deviceId": device,
+            },
+            key_id2: {
+                "algorithm": "Ed25519",
+                "publicKeyBase64": base64.b64encode(public2).decode(),
+            },
+        }}, fh)
 
     server = build_server("127.0.0.1", 0, db_path, keys_path)
     port = server.server_address[1]
@@ -143,6 +190,86 @@ def main() -> int:
               status == 200 and body.get("generation") == 2
               and body.get("configSha256") == hashlib.sha256(config2).hexdigest(),
               f"{status} {body}")
+
+        # ---- scheduled activation continues on the bound device -----------
+        # gens 1 and 2 above are immediate; admit an immediate gen 3 first.
+        env_s1 = signed_envelope("smoke-sched-1", key_id, device, 3, 2,
+                                 b"sched-config-v1", seed)
+        status, body = request(port, "POST", "/api/attestations", env_s1)
+        check("gen 3 accepted immediately",
+              status == 201 and "activateAt" not in body, f"{status} {body}")
+        status, body = request(port, "GET", f"/api/devices/{device}/effective")
+        check("effective is gen 3 before schedule arrives",
+              status == 200 and body.get("generation") == 3, f"{status} {body}")
+
+        activate = datetime.now(timezone.utc).replace(microsecond=0) + timedelta(seconds=6)
+        activate_stamp = utc_stamp(activate)
+        env_s2 = signed_envelope("smoke-sched-2", key_id, device, 4, 3,
+                                 b"sched-config-v2", seed, activate_at=activate_stamp)
+        status, body = request(port, "POST", "/api/attestations", env_s2)
+        check("scheduled gen 4 admitted (201) with activateAt",
+              status == 201 and body.get("activateAt") == activate_stamp,
+              f"{status} {body}")
+
+        status, head = request(port, "GET", f"/api/devices/{device}/head")
+        check("scheduled gen 4 is the admitted head immediately",
+              status == 200 and head.get("generation") == 4, f"{status} {head}")
+        status, eff = request(port, "GET", f"/api/devices/{device}/effective")
+        check("effective stays gen 3 while gen 4 is pending",
+              status == 200 and eff.get("generation") == 3
+              and eff.get("configSha256") == hashlib.sha256(b"sched-config-v1").hexdigest(),
+              f"{status} {eff}")
+
+        # illegal timestamp must be rejected without touching state
+        env_badtime = signed_envelope("smoke-sched-bad", key_id, device, 5, 4,
+                                      b"sched-config-v3", seed,
+                                      activate_at="2026-13-40T99:00:00Z")
+        status, body = request(port, "POST", "/api/attestations", env_badtime)
+        check("illegal activateAt rejected",
+              status == 400 and body["error"]["code"] == "INVALID_JSON_PAYLOAD",
+              f"{status} {body}")
+
+        # activation order regression (gen 5 earlier than gen 4)
+        env_regress = signed_envelope("smoke-sched-3", key_id, device, 5, 4,
+                                      b"sched-config-v3", seed,
+                                      activate_at=utc_stamp(activate - timedelta(seconds=1)))
+        status, body = request(port, "POST", "/api/attestations", env_regress)
+        check("activation order regression rejected",
+              status == 409 and body["error"]["code"] == "ACTIVATION_NOT_ORDERED",
+              f"{status} {body}")
+        status, eff = request(port, "GET", f"/api/devices/{device}/effective")
+        check("state unchanged after rejected schedules",
+              eff.get("generation") == 3, f"{status} {eff}")
+
+        # exact retry still replays the original (even once due)
+        status, body = request(port, "POST", "/api/attestations", env_s2)
+        check("scheduled gen 4 retry is duplicate with original result",
+              status == 200 and body.get("status") == "duplicate"
+              and body.get("activateAt") == activate_stamp, f"{status} {body}")
+
+        # cross the agreed second: a unique new generation becomes effective
+        flipped, body = wait_for_effective(port, device, 4, timeout=8)
+        check("only gen 4 is effective after crossing activateAt",
+              flipped and body.get("configSha256")
+              == hashlib.sha256(b"sched-config-v2").hexdigest()
+              and body.get("attestationId") == "smoke-sched-2",
+              f"{body}")
+        status, body = request(port, "GET", f"/api/devices/{device}/effective")
+        check("effective stays uniquely gen 4 afterwards",
+              status == 200 and body.get("generation") == 4, f"{status} {body}")
+
+        # device whose only config is scheduled in the future: stable error code
+        future_dev = "smoke-sat-future"
+        env_f = signed_envelope(
+            "smoke-future-1", key_id2, future_dev, 1, 0, b"future-config", seed2,
+            activate_at=utc_stamp(datetime.now(timezone.utc) + timedelta(hours=1)),
+        )
+        status, body = request(port, "POST", "/api/attestations", env_f)
+        check("future-only device admitted", status == 201, f"{status} {body}")
+        status, body = request(port, "GET", f"/api/devices/{future_dev}/effective")
+        check("future-only device has no effective config",
+              status == 404 and body["error"]["code"] == "NO_EFFECTIVE_CONFIG",
+              f"{status} {body}")
     finally:
         server.shutdown()
         server.server_close()
@@ -156,15 +283,32 @@ def main() -> int:
     try:
         status, body = request(port2, "GET", f"/api/devices/{device}/head")
         check("head survives restart",
-              status == 200 and body.get("generation") == 2
-              and body.get("configSha256") == hashlib.sha256(config2).hexdigest()
-              and body.get("attestationId") == "smoke-att-2",
+              status == 200 and body.get("generation") == 4
+              and body.get("configSha256") == hashlib.sha256(b"sched-config-v2").hexdigest()
+              and body.get("attestationId") == "smoke-sched-2",
               f"{status} {body}")
 
         # unknown device
         status, body = request(port2, "GET", "/api/devices/unknown/head")
         check("unknown device 404", status == 404
               and body["error"]["code"] == "DEVICE_NOT_FOUND", f"{status} {body}")
+
+        # scheduled activation state survives the restart
+        status, body = request(port2, "GET", f"/api/devices/{device}/head")
+        check("scheduled head survives restart",
+              status == 200 and body.get("generation") == 4
+              and body.get("activateAt") == activate_stamp, f"{status} {body}")
+        flipped, body = wait_for_effective(port2, device, 4, timeout=8)
+        check("scheduled gen 4 effective after restart once due",
+              flipped and body.get("attestationId") == "smoke-sched-2", f"{body}")
+        status, body = request(port2, "GET", f"/api/devices/{future_dev}/effective")
+        check("pending future config still not effective after restart",
+              status == 404 and body["error"]["code"] == "NO_EFFECTIVE_CONFIG",
+              f"{status} {body}")
+        status, body = request(port2, "GET", "/api/devices/ghost2/effective")
+        check("unknown device effective 404 stable code",
+              status == 404 and body["error"]["code"] == "NO_EFFECTIVE_CONFIG",
+              f"{status} {body}")
     finally:
         server2.shutdown()
         server2.server_close()

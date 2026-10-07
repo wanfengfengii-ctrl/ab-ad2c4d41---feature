@@ -9,6 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 
 from app import ed25519
 from app.server import build_server
@@ -20,6 +21,10 @@ KEY_ID = "http-vendor"
 
 def h(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
+
+
+def utc_stamp(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 class HttpCase(unittest.TestCase):
@@ -55,9 +60,12 @@ class HttpCase(unittest.TestCase):
         conn.close()
         return resp.status, json.loads(raw) if raw else {}
 
-    def attestation_body(self, att_id, device, gen, prev, config, *, bad_sig=False, key_id=KEY_ID):
+    def attestation_body(self, att_id, device, gen, prev, config, *, bad_sig=False,
+                         key_id=KEY_ID, activate_at=None):
         doc = {"deviceId": device, "generation": gen, "previousGeneration": prev,
                "configSha256": h(config)}
+        if activate_at is not None:
+            doc["activateAt"] = activate_at
         payload = json.dumps(doc, separators=(",", ":")).encode()
         sig = b"\x00" * 64 if bad_sig else ed25519.sign(payload, SEED)
         return {
@@ -140,6 +148,82 @@ class HttpCase(unittest.TestCase):
     def test_unknown_route(self):
         s, _ = self.req("GET", "/nope")
         self.assertEqual(s, 404)
+
+    def test_effective_unknown_device(self):
+        s, r = self.req("GET", "/api/devices/ghost/effective")
+        self.assertEqual(s, 404)
+        self.assertEqual(r["error"]["code"], "NO_EFFECTIVE_CONFIG")
+
+    def test_invalid_activate_at_rejected_without_state_change(self):
+        future = "2026-10-07T25:00:00Z"  # impossible hour
+        body = self.attestation_body("bad-time", "sat-t", 1, 0, b"c",
+                                     activate_at=future)
+        s, r = self.req("POST", "/api/attestations", body)
+        self.assertEqual(s, 400)
+        self.assertEqual(r["error"]["code"], "INVALID_JSON_PAYLOAD")
+        s, r = self.req("GET", "/api/devices/sat-t/head")
+        self.assertEqual(s, 404)
+
+    def test_scheduled_flow_and_real_time_boundary(self):
+        device = "sat-sched"
+        # gen 1 is immediately in effect
+        b1 = self.attestation_body("sched-1", device, 1, 0, b"config-v1")
+        s, r = self.req("POST", "/api/attestations", b1)
+        self.assertEqual(s, 201, r)
+        self.assertNotIn("activateAt", r)
+
+        s, r = self.req("GET", f"/api/devices/{device}/effective")
+        self.assertEqual(s, 200)
+        self.assertEqual(r["generation"], 1)
+
+        # gen 2 scheduled a couple of seconds in the future
+        activate = datetime.now(timezone.utc).replace(microsecond=0) + timedelta(seconds=2)
+        stamp = utc_stamp(activate)
+        b2 = self.attestation_body("sched-2", device, 2, 1, b"config-v2",
+                                   activate_at=stamp)
+        s, r = self.req("POST", "/api/attestations", b2)
+        self.assertEqual(s, 201, r)
+        self.assertEqual(r["activateAt"], stamp)
+
+        # head already advanced, but effective stays on the old generation
+        s, head = self.req("GET", f"/api/devices/{device}/head")
+        self.assertEqual(head["generation"], 2)
+        s, eff = self.req("GET", f"/api/devices/{device}/effective")
+        self.assertEqual(eff["generation"], 1)
+        self.assertEqual(eff["configSha256"], h(b"config-v1"))
+
+        # an activation regression (gen 3 before gen 2's instant) is rejected
+        past = utc_stamp(activate - timedelta(seconds=1))
+        b3 = self.attestation_body("sched-3", device, 3, 2, b"config-v3",
+                                   activate_at=past)
+        s, r = self.req("POST", "/api/attestations", b3)
+        self.assertEqual(s, 409)
+        self.assertEqual(r["error"]["code"], "ACTIVATION_NOT_ORDERED")
+
+        # retry of gen 2 replays the original result even after time passes
+        s, r = self.req("POST", "/api/attestations", b2)
+        self.assertEqual(s, 200)
+        self.assertEqual(r["status"], "duplicate")
+        self.assertEqual(r["activateAt"], stamp)
+
+        # cross the agreed second: exactly one new effective generation
+        flipped = False
+        deadline = time.time() + 8
+        last = None
+        while time.time() < deadline:
+            s, eff = self.req("GET", f"/api/devices/{device}/effective")
+            last = eff
+            if eff.get("generation") == 2:
+                flipped = True
+                break
+            time.sleep(0.1)
+        self.assertTrue(flipped, f"effective never flipped to gen 2: {last}")
+        self.assertEqual(last["configSha256"], h(b"config-v2"))
+        self.assertEqual(last["attestationId"], "sched-2")
+
+        # and it stays the unique effective generation
+        s, eff = self.req("GET", f"/api/devices/{device}/effective")
+        self.assertEqual(eff["generation"], 2)
 
 
 if __name__ == "__main__":

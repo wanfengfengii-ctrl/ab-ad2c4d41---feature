@@ -44,6 +44,8 @@ ERR_STALE_PREDECESSOR = "STALE_PREDECESSOR"
 ERR_ID_CONTENT_MISMATCH = "ATTESTATION_ID_CONTENT_MISMATCH"
 ERR_GENERATION_CONTENT_MISMATCH = "GENERATION_CONTENT_CONFLICT"
 ERR_RACE_LOST = "CONCURRENT_UPDATE"
+ERR_ACTIVATION_ORDER = "ACTIVATION_NOT_ORDERED"
+ERR_NO_EFFECTIVE = "NO_EFFECTIVE_CONFIG"
 ERR_INTERNAL = "INTERNAL_ERROR"
 
 
@@ -71,6 +73,35 @@ def _b64decode(data: str) -> bytes:
 
 def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# Strict RFC 3339 with a trailing Z and one-second precision, e.g.
+# ``2026-10-07T12:34:56Z`` (no offsets, no fractional seconds).
+_ACTIVATE_AT_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+
+
+def parse_activate_at(value: object) -> Optional[datetime]:
+    """Parse an optional strict ``activateAt``; None means "immediate"."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not _ACTIVATE_AT_RE.fullmatch(value):
+        raise ValueError(
+            "activateAt must be an RFC 3339 UTC timestamp with a trailing Z "
+            "and second precision, e.g. 2026-10-07T12:34:56Z"
+        )
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError as exc:
+        raise ValueError(f"activateAt is not a valid calendar timestamp: {exc}") from exc
+
+
+def _parse_stamp(stamp: str) -> datetime:
+    return datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+
+
+def _record_activation(rec) -> datetime:
+    """When a stored record takes effect: activateAt else acceptedAt."""
+    return _parse_stamp(rec.activate_at if rec.activate_at is not None else rec.accepted_at)
 
 
 def validate_payload(raw: bytes) -> dict:
@@ -106,6 +137,10 @@ def validate_payload(raw: bytes) -> dict:
         raise ValueError("payload field configSha256 must be a non-empty string")
     if not _HEX64.fullmatch(doc["configSha256"]):
         raise ValueError("payload field configSha256 must be 64 lowercase hex characters")
+    if "activateAt" in doc:
+        # Parsing here both validates the shape and rejects impossible dates;
+        # the original string is what gets persisted.
+        parse_activate_at(doc["activateAt"])
     return doc
 
 
@@ -185,7 +220,13 @@ class Admitter:
             generation=doc["generation"],
             previous_generation=doc["previousGeneration"],
             config_sha256=doc["configSha256"],
+            activate_at=doc.get("activateAt"),
         )
+
+    def effective(self, device_id: str) -> Optional[dict]:
+        """Currently effective (due) record: highest generation whose time has come."""
+        rec = self.store.effective(device_id, _now())
+        return rec.to_dict() if rec is not None else None
 
     def _persist(
         self,
@@ -196,8 +237,13 @@ class Admitter:
         generation: int,
         previous_generation: int,
         config_sha256: str,
+        activate_at: Optional[str] = None,
     ) -> AdmissionDecision:
         from .store import ConcurrentUpdateError
+
+        accepted_at = _now()
+        # Immediate (omitted activateAt) records take effect at acceptedAt.
+        new_activation = parse_activate_at(activate_at) or _parse_stamp(accepted_at)
 
         try:
             with self.store.transaction() as conn:
@@ -259,6 +305,17 @@ class Admitter:
                             f"generation {generation} must be greater than "
                             f"current head {head.generation}",
                         )
+                    # The new generation may not take effect before the
+                    # generation it builds on (the same instant is allowed).
+                    # This covers both scheduled successors (activateAt) and
+                    # immediate ones (effective at acceptedAt).
+                    if new_activation < _record_activation(head):
+                        return AdmissionDecision(
+                            False, 409, ERR_ACTIVATION_ORDER,
+                            f"activateAt {activate_at} must not be earlier than "
+                            f"the previous generation's activation time "
+                            f"{head.activate_at or head.accepted_at}",
+                        )
 
                 self.store.insert(
                     conn,
@@ -268,7 +325,8 @@ class Admitter:
                     config_sha256=config_sha256,
                     attestation_id=attestation_id,
                     payload_sha256=payload_sha,
-                    accepted_at=_now(),
+                    accepted_at=accepted_at,
+                    activate_at=activate_at,
                 )
                 rec = self.store.find(conn, device_id, generation)
                 return AdmissionDecision(

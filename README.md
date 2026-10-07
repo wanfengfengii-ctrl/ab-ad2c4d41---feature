@@ -30,22 +30,22 @@
   "deviceId": "sat-alpha",
   "generation": 2,
   "previousGeneration": 1,
-  "configSha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+  "configSha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+  "activateAt": "2026-10-07T12:00:00Z"
 }
 ```
 
 `configSha256` 必须是 **64 位小写十六进制**的配置 SHA-256。
 
-接纳规则：
+`activateAt` **可选**：
 
-1. 用 `keyId` 对应的部署公钥验证签名；未知密钥 / 错误签名一律拒绝，且**不改变状态**。
-2. 每台设备**首次**提交的 `previousGeneration` 必须为 `0`，且 `generation > 0`。
-3. 后续提交必须 `previousGeneration == 当前已接纳 generation` 且 `generation` 严格更大（允许跳号）。
-4. **相同编号 + 字节级相同内容**的重试：返回原接纳结果（`200`，`status:"duplicate"`），不写新状态。
-5. 相同编号但内容不同、同代次异内容、过期前代：均为 `409` 冲突，状态不变。
-6. 并发请求由数据库写锁串行化，同一后继代次只有一个胜者，败者得到 `409 CONCURRENT_UPDATE`/冲突码，不产生分叉。
+- 省略时行为完全不变——请求、响应、错误语义不变，配置在接纳时**立即生效**。
+- 提供时必须是带 `Z`、精确到秒的 RFC3339 UTC 时刻（如 `2026-10-07T12:00:00Z`；不接受时区偏移、小数秒）。
+- **已接纳不等于已生效**：带计划的证明立即写入已接纳头（`/head`），但在约定 UTC 秒到来前不会出现在 `/effective` 中；到时后只切换到这一个新生效代次。
+- 后继代次的 `activateAt` 不得早于上一代的生效时刻（上一代省略 `activateAt` 时以其 `acceptedAt` 为准）；允许同一时刻。
+- 同编号同内容重试即使发生在计划时刻之后，也只回放原接纳结果（`200 status:"duplicate"`，原始 `acceptedAt`/`activateAt`），绝不生成第二条记录。
 
-成功响应：`201`（首次）或 `200`（重试）：
+成功响应：`201`（首次）或 `200`（重试）；带计划时附带同样的 `activateAt`，省略时响应形状不变：
 
 ```json
 {
@@ -55,13 +55,34 @@
   "previousGeneration": 1,
   "configSha256": "...",
   "attestationId": "...",
-  "acceptedAt": "2026-10-06T16:34:16Z"
+  "acceptedAt": "2026-10-06T16:34:16Z",
+  "activateAt": "2026-10-07T12:00:00Z"
 }
 ```
 
+接纳规则：
+
+1. 用 `keyId` 对应的部署公钥验证签名；未知密钥 / 错误签名一律拒绝，且**不改变状态**。
+2. 每台设备**首次**提交的 `previousGeneration` 必须为 `0`，且 `generation > 0`。
+3. 后续提交必须 `previousGeneration == 当前已接纳 generation` 且 `generation` 严格更大（允许跳号）。
+4. **相同编号 + 字节级相同内容**的重试：返回原接纳结果（`200`，`status:"duplicate"`），不写新状态。
+5. 相同编号但内容不同、同代次异内容、过期前代、生效时刻早于上一代：均为 `409` 冲突，状态不变。
+6. 非法 `activateAt` 为 `400 INVALID_JSON_PAYLOAD`，且不改变已接纳头或当前生效配置。
+7. 并发请求由数据库写锁串行化，同一后继代次只有一个胜者，败者得到 `409 CONCURRENT_UPDATE`/冲突码，不产生分叉。
+
 ### `GET /api/devices/{deviceId}/head`
 
-返回设备当前**唯一**已接纳代次与配置摘要；服务重启后结果不变。未知设备返回 `404 DEVICE_NOT_FOUND`。
+返回设备当前**唯一**已接纳代次与配置摘要（含尚未到生效时刻的计划）；服务重启后结果不变。未知设备返回 `404 DEVICE_NOT_FOUND`。
+
+### `GET /api/devices/{deviceId}/effective`
+
+按**当前 UTC 时间**返回已到生效时刻的计划中代次最高的配置：新头尚未到时旧代继续生效；跨过约定秒后只能查到唯一的新生效代次。
+
+- 无任何已接纳记录：`404 DEVICE_NOT_FOUND`。
+- 已有接纳但所有代次都未到生效时刻：稳定错误码 `404 NO_EFFECTIVE_CONFIG`。
+- 升级前卷中没有 `activateAt` 的记录视为在其原 `acceptedAt` 立即生效。
+
+响应体与 `/head` 单条记录相同（带计划时含 `activateAt`）。
 
 ### 稳定错误码
 
@@ -69,7 +90,7 @@
 | --- | --- | --- |
 | 400 | `MALFORMED_REQUEST` | 请求字段缺失/类型错误、非 JSON |
 | 400 | `INVALID_BASE64` | Base64 无法解码 |
-| 400 | `INVALID_JSON_PAYLOAD` | 载荷非 UTF-8 JSON、缺字段、代次非整数、哈希格式错 |
+| 400 | `INVALID_JSON_PAYLOAD` | 载荷非 UTF-8 JSON、缺字段、代次非整数、哈希格式错、`activateAt` 非带 Z 精确到秒的 RFC3339 时刻 |
 | 401 | `UNKNOWN_KEY_ID` | 部署声明中不存在该 `keyId` |
 | 401 | `INVALID_SIGNATURE` | Ed25519 验签失败 |
 | 403 | `KEY_NOT_BOUND_TO_DEVICE` | 密钥绑定了其它设备 |
@@ -79,9 +100,11 @@
 | 409 | `STALE_PREDECESSOR` | 前代不等于当前头（过期/回退/重放） |
 | 409 | `ATTESTATION_ID_CONTENT_MISMATCH` | 编号复用但签名内容不同 |
 | 409 | `GENERATION_CONTENT_CONFLICT` | 同代次已接纳不同内容 |
+| 409 | `ACTIVATION_TIME_NOT_ADVANCED` | `activateAt` 早于上一代的生效时刻 |
 | 409 | `CONCURRENT_UPDATE` | 并发竞争失败（请重新读取 head 后重试） |
+| 404 | `NO_EFFECTIVE_CONFIG` | `/effective`：设备已有接纳记录，但尚无代次到生效时刻 |
 
-所有冲突/鉴权失败都不会推进设备状态。
+所有冲突/鉴权/格式失败都不会推进设备状态（已接纳头与当前生效配置均不变）。
 
 ## 部署声明的公钥
 
@@ -136,7 +159,7 @@ docker compose run --build --rm verify
 # 全部通过 -> 退出码 0；任一失败 -> 退出码非 0
 ```
 
-冒烟在容器内自起一个临时 HTTP 服务，覆盖：健康检查、首次接纳、幂等重试、错误签名/未知密钥拒绝、后继承接、过期前代冲突、以及**重启同一数据库后 head 仍唯一且分叉尝试被拒**。
+冒烟在容器内自起一个临时 HTTP 服务，覆盖：健康检查、首次接纳、幂等重试、错误签名/未知密钥拒绝、后继承接、过期前代冲突、计划接纳与**跨过约定 UTC 秒后唯一生效代次切换**、时刻过后重试回放、以及**重启同一数据库后 head/effective 与待生效计划均保持一致**。
 
 ## 测试
 
@@ -147,4 +170,5 @@ python3 -m unittest discover -v -s tests
 ```
 
 测试包含 RFC 8032 官方向量、与 `cryptography` 库的双向互操作校验、接纳链规则、
-同编号/同代次冲突、线程内与**跨进程**并发竞争、以及真实进程 `kill -9` 后的持久化验证。
+同编号/同代次冲突、`activateAt` 计划生效与生效次序校验、跨秒边界切换、
+线程内与**跨进程**并发竞争、升级前卷迁移、以及真实进程 `kill -9` 后的持久化验证。

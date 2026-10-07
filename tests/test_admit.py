@@ -4,8 +4,10 @@ import base64
 import hashlib
 import json
 import os
+import sqlite3
 import tempfile
 import threading
+import time
 import unittest
 
 from app import ed25519
@@ -253,6 +255,212 @@ class Case(unittest.TestCase):
         self.assertEqual(len(accepted_201), 1, results)
         self.assertTrue(all(r[1] for r in results), results)
         self.assertEqual(len(self.store.accepted_generations("dev")), 1)
+
+    # ------------------------------------------------------------- schedule
+    def test_omitted_activate_at_is_immediate(self):
+        d, _, _ = self.submit("a1", "dev", 1, 0, b"cfg-1")
+        self.assertTrue(d.accepted)
+        self.assertIsNone(d.record["activateAt"])
+        head = self.store.head("dev")
+        self.assertIsNone(head.activate_at)
+        self.assertEqual(head.effective_at, head.accepted_at)
+        eff = self.admitter.effective("dev")
+        self.assertEqual(eff["generation"], 1)
+
+    def test_scheduled_not_effective_until_due(self):
+        future = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 60))
+        d, _, _ = self.submit("a1", "dev", 1, 0, b"cfg-1", extra={"activateAt": future})
+        self.assertTrue(d.accepted)
+        self.assertEqual(d.status, 201)
+        self.assertEqual(d.record["activateAt"], future)
+        # accepted head advances ...
+        self.assertEqual(self.admitter.head("dev")["generation"], 1)
+        # ... but nothing is effective yet
+        self.assertIsNone(self.admitter.effective("dev"))
+        # it is effective when queried at/past the scheduled second
+        eff = self.admitter.effective("dev", now=future)
+        self.assertEqual(eff["generation"], 1)
+
+    def test_scheduled_successor_chain_and_effective_pick(self):
+        # gen 1 immediately effective (legacy-style)
+        self.submit("a1", "dev", 1, 0, b"cfg-1")
+        t1 = time.gmtime(time.time() + 30)
+        t2 = time.strftime("%Y-%m-%dT%H:%M:%SZ", t1)
+        d2, _, _ = self.submit("a2", "dev", 2, 1, b"cfg-2", extra={"activateAt": t2})
+        self.assertTrue(d2.accepted, d2.message)
+        t3 = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                           time.gmtime(time.time() + 90))
+        d3, _, _ = self.submit("a3", "dev", 3, 2, b"cfg-3", extra={"activateAt": t3})
+        self.assertTrue(d3.accepted, d3.message)
+
+        now_before = time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 10))
+        self.assertEqual(self.admitter.effective("dev", now=now_before)["generation"], 1)
+        self.assertEqual(self.admitter.effective("dev", now=t2)["generation"], 2)
+        self.assertEqual(
+            self.admitter.effective("dev", now=t2)["configSha256"], digest(b"cfg-2"))
+        self.assertEqual(self.admitter.effective("dev", now=t3)["generation"], 3)
+        # head remains the highest accepted regardless of time
+        self.assertEqual(self.admitter.head("dev")["generation"], 3)
+
+    def test_activation_order_regression_rejected(self):
+        past = time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 60))
+        self.submit("a1", "dev", 1, 0, b"cfg-1", extra={"activateAt": past})
+        # successor scheduled before the previous generation's effective time
+        older = time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 120))
+        d, _, _ = self.submit("a2", "dev", 2, 1, b"cfg-2",
+                              extra={"activateAt": older})
+        self.assertFalse(d.accepted)
+        self.assertEqual(d.code, "ACTIVATION_TIME_NOT_ADVANCED")
+        # state untouched: head still gen 1, which is effective (past)
+        self.assertEqual(self.admitter.head("dev")["generation"], 1)
+        self.assertEqual(self.admitter.effective("dev")["generation"], 1)
+
+    def test_equal_activation_time_allowed(self):
+        ts = "2026-10-07T12:00:00Z"
+        d1, _, _ = self.submit("a1", "dev", 1, 0, b"cfg-1",
+                               extra={"activateAt": ts})
+        self.assertTrue(d1.accepted)
+        d2, _, _ = self.submit("a2", "dev", 2, 1, b"cfg-2",
+                               extra={"activateAt": ts})
+        self.assertTrue(d2.accepted, d2.message)
+        eff = self.admitter.effective("dev", now=ts)
+        self.assertEqual(eff["generation"], 2)
+
+    def test_invalid_activate_at_shapes_rejected(self):
+        bad_values = [
+            "2026-10-07T12:00:00+00:00",  # offset instead of Z
+            "2026-10-07T12:00:00",        # no Z
+            "2026-10-07T12:00Z",          # minute precision
+            "2026-10-07T12:00:00.5Z",     # fractional seconds
+            "2026-13-07T12:00:00Z",       # month 13
+            "2026-10-07 12:00:00Z",       # space separator
+            12345,                        # non-string
+            "not-a-time",
+        ]
+        for value in bad_values:
+            d, _, _ = self.submit("x", "dev", 1, 0, b"cfg-1",
+                                  extra={"activateAt": value})
+            self.assertFalse(d.accepted, value)
+            self.assertEqual(d.code, "INVALID_JSON_PAYLOAD", value)
+        self.assertIsNone(self.admitter.head("dev"))
+
+    def test_scheduled_retry_replays_after_time_passes(self):
+        future = time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 2))
+        d1, payload, sig = self.submit(
+            "a1", "dev", 1, 0, b"cfg-1", extra={"activateAt": future})
+        self.assertEqual(d1.status, 201)
+        before = self.store.accepted_generations("dev")
+
+        # wait until the scheduled second (and a bit) has passed
+        time.sleep(3)
+        replay = self.admitter.admit(
+            attestation_id="a1",
+            key_id=KEY_ID,
+            payload_b64=base64.b64encode(payload).decode(),
+            signature_b64=base64.b64encode(sig).decode(),
+        )
+        self.assertTrue(replay.accepted)
+        self.assertEqual(replay.status, 200)
+        self.assertTrue(replay.duplicate)
+        self.assertEqual(replay.record["activateAt"], future)
+        # still exactly one row
+        self.assertEqual(self.store.accepted_generations("dev"), before)
+        # and the original plan is now the unique effective generation
+        self.assertEqual(self.admitter.effective("dev")["generation"], 1)
+
+    def test_old_generation_still_effective_while_new_pending(self):
+        self.submit("a1", "dev", 1, 0, b"cfg-1")
+        future = time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 120))
+        d2, _, _ = self.submit("a2", "dev", 2, 1, b"cfg-2",
+                               extra={"activateAt": future})
+        self.assertTrue(d2.accepted)
+        eff = self.admitter.effective("dev")
+        self.assertEqual(eff["generation"], 1)
+        self.assertEqual(eff["configSha256"], digest(b"cfg-1"))
+
+    def test_scheduled_successor_must_follow_accepted_head(self):
+        future = time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 60))
+        self.submit("a1", "dev", 1, 0, b"cfg-1")
+        # claims predecessor 0 even though head is 1 -> stale, state unchanged
+        d, _, _ = self.submit("a2", "dev", 2, 0, b"cfg-2",
+                              extra={"activateAt": future})
+        self.assertEqual(d.code, "STALE_PREDECESSOR")
+        self.assertEqual(len(self.store.accepted_generations("dev")), 1)
+
+
+class PreUpgradeVolumeTests(unittest.TestCase):
+    """Records written by the old schema must behave as immediately effective."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = os.path.join(self.tmp.name, "att.db")
+        accepted_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        # Create the database using the pre-upgrade schema (no activate_at).
+        conn = sqlite3.connect(self.db)
+        conn.execute(
+            "CREATE TABLE attestations ("
+            "device_id TEXT NOT NULL, generation INTEGER NOT NULL, "
+            "previous_generation INTEGER NOT NULL, config_sha256 TEXT NOT NULL, "
+            "attestation_id TEXT NOT NULL, payload_sha256 TEXT NOT NULL, "
+            "accepted_at TEXT NOT NULL, PRIMARY KEY (device_id, generation), "
+            "UNIQUE (attestation_id))"
+        )
+        conn.execute(
+            "INSERT INTO attestations VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("dev", 1, 0, digest(b"cfg-1"), "old-1", "payload-sha", accepted_at),
+        )
+        conn.commit()
+        conn.close()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_migrates_and_legacy_row_is_effective_at_accepted_at(self):
+        # opening with the new code migrates the schema in place
+        store = Store(self.db)
+        adm = Admitter(store, {KEY_ID: PUB}, {KEY_ID: None})
+        head = adm.head("dev")
+        self.assertEqual(head["generation"], 1)
+        self.assertIsNone(head["activateAt"])
+        eff = adm.effective("dev")
+        self.assertIsNotNone(eff)
+        self.assertEqual(eff["generation"], 1)
+        self.assertEqual(eff["configSha256"], digest(b"cfg-1"))
+        # a scheduled successor may be chained onto the migrated row
+        future = time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 60))
+        d, _, _ = _submit_with(adm, "new-1", "dev", 2, 1, b"cfg-2",
+                               extra={"activateAt": future})
+        self.assertTrue(d.accepted, d.message)
+        # successor still pending now (old generation keeps serving) ...
+        self.assertEqual(adm.effective("dev")["generation"], 1)
+        # ... but becomes the unique effective generation at the scheduled time
+        self.assertEqual(adm.effective("dev", now=future)["generation"], 2)
+
+
+def _submit_with(adm, att_id, device, gen, prev, config, *, extra=None):
+    doc = {
+        "deviceId": device,
+        "generation": gen,
+        "previousGeneration": prev,
+        "configSha256": digest(config),
+    }
+    if extra:
+        doc.update(extra)
+    payload = json.dumps(doc, separators=(",", ":")).encode("utf-8")
+    sig = ed25519.sign(payload, SEED)
+    return adm.admit(
+        attestation_id=att_id,
+        key_id=KEY_ID,
+        payload_b64=base64.b64encode(payload).decode(),
+        signature_b64=base64.b64encode(sig).decode(),
+    ), payload, sig
 
 
 def _multiprocess_worker(db_path, att_id, config_byte):

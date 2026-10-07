@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS attestations (
     attestation_id    TEXT    NOT NULL,
     payload_sha256    TEXT    NOT NULL,
     accepted_at       TEXT    NOT NULL,
+    activate_at       TEXT,
     PRIMARY KEY (device_id, generation),
     UNIQUE (attestation_id)
 );
@@ -39,6 +40,7 @@ class StoredAttestation:
         "attestation_id",
         "payload_sha256",
         "accepted_at",
+        "activate_at",
     )
 
     def __init__(self, row: sqlite3.Row):
@@ -49,6 +51,14 @@ class StoredAttestation:
         self.attestation_id = row["attestation_id"]
         self.payload_sha256 = row["payload_sha256"]
         self.accepted_at = row["accepted_at"]
+        # NULL for pre-upgrade rows and requests without activateAt: such
+        # records take effect immediately at accepted_at.
+        self.activate_at = row["activate_at"]
+
+    @property
+    def effective_at(self) -> str:
+        """UTC second at which the record becomes (or became) effective."""
+        return self.activate_at or self.accepted_at
 
     def to_dict(self) -> dict:
         return {
@@ -58,6 +68,8 @@ class StoredAttestation:
             "configSha256": self.config_sha256,
             "attestationId": self.attestation_id,
             "acceptedAt": self.accepted_at,
+            "activateAt": self.activate_at,
+            "effectiveAt": self.effective_at,
         }
 
 
@@ -74,7 +86,19 @@ class Store:
         self._busy_timeout = busy_timeout_ms
         with self._connect() as conn:
             conn.executescript(SCHEMA)
+            self._migrate(conn)
             conn.commit()
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """Upgrade pre-feature databases in place.
+
+        Pre-upgrade rows have no ``activate_at``; NULL means "effective
+        immediately at accepted_at", so backfilling is unnecessary.
+        """
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(attestations)")}
+        if "activate_at" not in cols:
+            conn.execute("ALTER TABLE attestations ADD COLUMN activate_at TEXT")
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(
@@ -136,12 +160,13 @@ class Store:
         attestation_id: str,
         payload_sha256: str,
         accepted_at: str,
+        activate_at: Optional[str] = None,
     ) -> None:
         conn.execute(
             "INSERT INTO attestations "
             "(device_id, generation, previous_generation, config_sha256, "
-            " attestation_id, payload_sha256, accepted_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            " attestation_id, payload_sha256, accepted_at, activate_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 device_id,
                 generation,
@@ -150,6 +175,7 @@ class Store:
                 attestation_id,
                 payload_sha256,
                 accepted_at,
+                activate_at,
             ),
         )
 
@@ -180,6 +206,31 @@ class Store:
             "ORDER BY generation DESC LIMIT 1",
             (device_id,),
         ).fetchone()
+        return StoredAttestation(row) if row is not None else None
+
+    @staticmethod
+    def _effective_clause(now: str) -> str:
+        # activate_at NULL  -> effective at accepted_at (pre-upgrade rows and
+        # requests that omitted activateAt, i.e. immediate activation).
+        return "COALESCE(activate_at, accepted_at) <= ?"
+
+    def effective(
+        self, device_id: str, now: Optional[str] = None
+    ) -> Optional[StoredAttestation]:
+        """Highest-generation record whose effective time has passed.
+
+        ``now`` defaults to the current UTC second; callers may inject a fixed
+        RFC3339 second for deterministic tests.
+        """
+        if now is None:
+            now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM attestations WHERE device_id = ? AND "
+                + self._effective_clause(now)
+                + " ORDER BY generation DESC LIMIT 1",
+                (device_id, now),
+            ).fetchone()
         return StoredAttestation(row) if row is not None else None
 
     def accepted_generations(self, device_id: str) -> list[int]:

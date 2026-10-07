@@ -2,9 +2,10 @@
 
 Endpoints
 ---------
-GET  /healthz                         liveness/readiness probe
-POST /api/attestations                submit a signed attestation
-GET  /api/devices/{deviceId}/head     current accepted generation + digest
+GET  /healthz                                liveness/readiness probe
+POST /api/attestations                       submit a signed attestation
+GET  /api/devices/{deviceId}/head            current accepted generation + digest
+GET  /api/devices/{deviceId}/effective       highest generation already in effect
 
 All errors return JSON ``{"error": {"code", "message"}}`` with a stable
 machine-readable ``code``.
@@ -22,6 +23,7 @@ from .admit import (
     Admitter,
     ERR_INTERNAL,
     ERR_MALFORMED,
+    ERR_NO_EFFECTIVE,
 )
 from .config import KeyConfigError, load_key_bindings, load_keys
 from .store import Store
@@ -59,6 +61,22 @@ class Handler(BaseHTTPRequestHandler):
     def _error(self, status: int, code: str, message: str) -> None:
         self._send_json(status, {"error": {"code": code, "message": message}})
 
+    @staticmethod
+    def _record_body(rec: dict) -> dict:
+        """Serialize a stored record; activateAt appears only when scheduled."""
+        body = {
+            "deviceId": rec.get("deviceId"),
+            "generation": rec.get("generation"),
+            "previousGeneration": rec.get("previousGeneration"),
+            "configSha256": rec.get("configSha256"),
+            "attestationId": rec.get("attestationId"),
+            "acceptedAt": rec.get("acceptedAt"),
+        }
+        # When activateAt was omitted the response shape is unchanged.
+        if rec.get("activateAt") is not None:
+            body["activateAt"] = rec.get("activateAt")
+        return body
+
     def _read_json_body(self) -> dict | None:
         length = self.headers.get("Content-Length")
         if length is None:
@@ -90,27 +108,40 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(200, {"status": "ok"})
             return
         prefix = "/api/devices/"
-        suffix = "/head"
-        if path.startswith(prefix) and path.endswith(suffix):
-            device_id = unquote(path[len(prefix) : -len(suffix)])
+        device_id, view = None, None
+        for suffix, name in (("/effective", "effective"), ("/head", "head")):
+            if path.startswith(prefix) and path.endswith(suffix):
+                device_id = unquote(path[len(prefix) : -len(suffix)])
+                view = name
+                break
+        if view is not None:
             if not device_id or "/" in device_id:
                 self._error(404, "NOT_FOUND", "unknown path")
                 return
-            head = self.admitter.head(device_id)
-            if head is None:
-                self._error(404, "DEVICE_NOT_FOUND", f"no accepted attestation for device {device_id!r}")
+            if view == "head":
+                rec = self.admitter.head(device_id)
+                not_found_code = "DEVICE_NOT_FOUND"
+            else:
+                rec = self.admitter.effective(device_id)
+                # A device may already have accepted (but not yet due)
+                # generations; distinguish "unknown device" from "nothing
+                # effective yet" using the accepted head.
+                if rec is None and self.admitter.head(device_id) is None:
+                    not_found_code = "DEVICE_NOT_FOUND"
+                else:
+                    not_found_code = ERR_NO_EFFECTIVE
+            if rec is None:
+                self._error(
+                    404, not_found_code,
+                    (
+                        f"no accepted attestation for device {device_id!r}"
+                        if not_found_code == "DEVICE_NOT_FOUND"
+                        else f"no configuration for device {device_id!r} has reached "
+                        "its activation time yet"
+                    ),
+                )
                 return
-            self._send_json(
-                200,
-                {
-                    "deviceId": head["deviceId"],
-                    "generation": head["generation"],
-                    "previousGeneration": head["previousGeneration"],
-                    "configSha256": head["configSha256"],
-                    "attestationId": head["attestationId"],
-                    "acceptedAt": head["acceptedAt"],
-                },
-            )
+            self._send_json(200, self._record_body(rec))
             return
         self._error(404, "NOT_FOUND", "unknown path")
 
@@ -131,18 +162,9 @@ class Handler(BaseHTTPRequestHandler):
         )
         if decision.accepted:
             rec = decision.record or {}
-            self._send_json(
-                decision.status,
-                {
-                    "status": "duplicate" if decision.duplicate else "accepted",
-                    "deviceId": rec.get("deviceId"),
-                    "generation": rec.get("generation"),
-                    "previousGeneration": rec.get("previousGeneration"),
-                    "configSha256": rec.get("configSha256"),
-                    "attestationId": rec.get("attestationId"),
-                    "acceptedAt": rec.get("acceptedAt"),
-                },
-            )
+            body = self._record_body(rec)
+            body["status"] = "duplicate" if decision.duplicate else "accepted"
+            self._send_json(decision.status, body)
         else:
             self._error(decision.status, decision.code, decision.message)
 
